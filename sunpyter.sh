@@ -1,79 +1,102 @@
 #!/bin/bash --login
+set -eu
+source ./find_resources.sh
+source ./cleanup.sh
 
 if [ $# -ne 1 ]
 then
-    echo "Usage: $0 <config>"
+    echo "Usage: $0 <your_sunbird_username>"
     exit
 fi
+trap cleanup EXIT
 
-CONFIG=$1
-source $CONFIG
+USERNAME=$1
+REMOTE=$USERNAME@sunbird.swansea.ac.uk
 
-if [ -z "$REMOTE" ]
-then 
-    echo "Please give a remote, e.g. username@vnc.sunbird.swansea.ac.uk"
-    exit
-fi
+setup_ssh_agent(){
+    echo > .ssh_agent_setup
+    export SUNPYTER_SSH_AGENT='false'
+    ssh -oBatchMode=yes $REMOTE "echo Passwordless access to Sunbird correctly set up." || (
+        echo "Creating new ssh agent" 
+        ssh-agent > .ssh_agent_setup # sets SSH_AGENT_PID
+        echo "export SUNPYTER_SSH_AGENT=true" >> .ssh_agent_setup
+        source .ssh_agent_setup
+        ssh-add ~/.ssh/id_rsa
+    )
+    source .ssh_agent_setup
+}
 
-if [ -z "$ACCOUNT" -a "$RUNWHERE" == "compute" ]
-then 
-    echo "Please give an account, e.g. your project name (scwXXXX)"
-    exit
-fi
+setup_ssh_agent
 
-if [ -z "$SHELLSETUP" ]
-then 
-    echo "Please give the name of a file containing the bash commands needed"
-    echo "to set up the environment, e.g. the commands to:"
-    echo "   1. Activate the right conda environment"
-    echo "   2. Change directory to the right location before starting the"
-    echo "      jupyter notebook process."
-    echo "Please see example."
-    exit
-fi
+JUPYTER_LOG=jupyter_log.txt # for scraping
+SSH_MASTER_SOCKET=$(find_free_ssh_socket)
+echo "Free socket for ssh_master: ${SSH_MASTER_SOCKET}"
 
-if [ "$RUNWHERE" == "compute" ]
-then 
-    LAUNCH_JUPYTER_COMMAND=launch_jupyter_compute.sh
-elif [ "$RUNWHERE" == "login" ]
+start_jupyter_and_write_log(){
+    local REMOTE=$1
+    local JUPYTER_LOG=$2
+    local REMOTE_SCRIPT=$3
+    ssh -S ${SSH_MASTER_SOCKET} -M $REMOTE 'bash -s' < $REMOTE_SCRIPT &> $JUPYTER_LOG &
+    sleep 5 # BODGE - wait for the ssh socket to be created
+}
+
+start_jupyter_and_write_log $REMOTE $JUPYTER_LOG remote_script.sh
+
+if [ -S ${SSH_MASTER_SOCKET} ]
 then
-    LAUNCH_JUPYTER_COMMAND=launch_jupyter_login.sh
+    echo "SSH socket created..."
 else
-    echo 'Wrong launch specification, use either "login" or "compute".'
+    echo "SSH Socket creation failed: exiting"
     exit
 fi
 
-ssh $REMOTE 'bash -s' < <( cat launch_jupyter_preamble.sh "$SHELLSETUP" "$LAUNCH_JUPYTER_COMMAND" | sed 's/SEDACCOUNT/'$ACCOUNT'/') &> jupyter_log.txt &
-
-SSHPROC=$( ps -ef | grep ssh | grep $REMOTE | grep bash | grep -v grep | awk '{print $2}'| sort -n | tail -n 1)
-echo SSHPROC=$SSHPROC
 echo "Waiting for jupyter notebook to start on server..."
 
-RUNNINGCONFIRMATIONSTRING="Use Control-C to stop this server and shut down all kernels (twice to skip confirmation)."
-
 printf "Waiting..."
-while [ $(grep $RUNNINGCONFIRMATIONSTRING jupyter_log.txt 2>/dev/null | wc -l ) -eq 0 ]
-do
-    sleep 1
-    printf .
-done
+
+check_for_errors(){
+    FILE=$1
+    grep ERROR $FILE
+}
+
+wait_for_jupyter_server_to_start(){
+    local JUPYTER_LOG=$1
+    local RUNNINGCONFIRMATIONSTRING="Use Control-C to stop this server and shut down all kernels (twice to skip confirmation)."
+    while [ $(grep $RUNNINGCONFIRMATIONSTRING $JUPYTER_LOG 2>/dev/null | wc -l ) -eq 0 ]
+    do
+      if [ $(check_for_errors $JUPYTER_LOG | wc -l) -ne 0 ] 
+      then 
+        echo # new line for readability
+        check_for_errors $JUPYTER_LOG 
+        exit
+      fi 
+      sleep 1
+      printf .
+    done
+}
+
+wait_for_jupyter_server_to_start $JUPYTER_LOG
+
 echo "Launched."
 
 echo "Output from the server:"
 echo "========================================================================"
-cat jupyter_log.txt
+cat $JUPYTER_LOG
 echo "========================================================================"
 
 # We have a running jupyter notebook server, hooray!
-############################################################
-# MINING THE OUTPUT OF THE COMMAND TO FIND CONNECTION INFO #
-############################################################
+##############################################################
+# SCRAPING THE OUTPUT OF THE COMMAND TO FIND CONNECTION INFO #
+##############################################################
 
 # The command to create the tunnel contains the host and the port, and that 
 # comes from the script running on sunbird.
 
 # This 'purification' is needed to prevent grep from misreading the file
-LINE=$(cat jupyter_log.txt | tr -d '\000' | grep -A 1 "The Jupyter Notebook is running at:" | tail -n 1)
+LINE=$(cat jupyter_log.txt | tr -d '\000' | grep -A 1 -E "Jupyter\s*Notebook.*is\s*running\s*at:" | tail -n 1) 
+
+echo Log Line with connection information:
+echo $LINE
 
 REMOTE_HOST_AND_PORT=$(echo $LINE | sed -E 's|.*http://(.*)/\?token=([0-9a-f]+)$|\1|')
 AUTH_TOKEN=$(echo $LINE | sed -E 's|.*http://(.*)/\?token=([0-9a-f]+)$|\2|')
@@ -81,22 +104,8 @@ AUTH_TOKEN=$(echo $LINE | sed -E 's|.*http://(.*)/\?token=([0-9a-f]+)$|\2|')
 #############################
 # Finding a free local port #
 #############################
-JUPYTER_LOCAL_PORT=8888  # Start from this one 
 
-# different machines can have different commands for this
-CHECKPORTSS="ss -Htan | awk '{print \$4}' | cut -d':' -f2 | grep "
-CHECKPORTLSOF="lsof -i :"
-
-# Checking which command is available
-which ss &> /dev/null && CHECKPORT="$CHECKPORTSS"
-[ -z "$CHECKPORT" ] && which lsof &> /dev/null && CHECKPORT="$CHECKPORTLSOF"
-
-# iterating until we find a free port.
-while [ $( bash -s < <(echo "$CHECKPORT$JUPYTER_LOCAL_PORT") 2>/dev/null | wc -l) -gt 0 ]
-do 
-    echo "Port $JUPYTER_LOCAL_PORT is in use, trying next..."
-    JUPYTER_LOCAL_PORT=$((JUPYTER_LOCAL_PORT+1))
-done
+JUPYTER_LOCAL_PORT=$(get_free_local_port)
 
 echo "Using local port $JUPYTER_LOCAL_PORT"
 
@@ -105,51 +114,61 @@ echo "Using local port $JUPYTER_LOCAL_PORT"
 ################################
 
 echo "Creating ssh tunnnel:"
-echo "ssh -L $JUPYTER_LOCAL_PORT:$REMOTE_HOST_AND_PORT -fN $REMOTE"
-ssh -L $JUPYTER_LOCAL_PORT:$REMOTE_HOST_AND_PORT -fN $REMOTE
-SSHTUNNELPROC=$( ps -ef | grep ssh | grep $JUPYTER_LOCAL_PORT:$REMOTE_HOST_AND_PORT | grep -v grep | awk '{print $2}')
-echo SSHTUNNELPROC=$SSHTUNNELPROC
-
+echo ssh -S ${SSH_MASTER_SOCKET} -L $JUPYTER_LOCAL_PORT:$REMOTE_HOST_AND_PORT -fN $REMOTE
+ssh -S ${SSH_MASTER_SOCKET} -L $JUPYTER_LOCAL_PORT:$REMOTE_HOST_AND_PORT -fN $REMOTE
 
 # chosing program to open link.
-which open &> /dev/null && OPEN=open 
-[ -z "$OPEN" ] && which xdg-open &> /dev/null && OPEN=xdg-open
-
-echo "Opening link..."
-echo $OPEN http://localhost:$JUPYTER_LOCAL_PORT/?token=$AUTH_TOKEN
-$OPEN http://localhost:$JUPYTER_LOCAL_PORT/?token=$AUTH_TOKEN
-
-###############
-# Cleaning up #
-###############
-
-cleanup(){
-    export SLURMJOB=$(cat jupyter_log.txt | tr -d '\000' | grep "Submitted batch job" | awk '{print $4}' 2> /dev/null)
-    echo "SLURM JOB:$SLURMJOB"
-    
-    export JUPYTER_PROCESS=$(cat jupyter_log.txt | tr -d '\000' | grep "JUPYTER_PROCESS" | awk '{print $2}' 2> /dev/null)
-    echo "JUPYTER_PROCESS: $JUPYTER_PROCESS"
-
-    echo "Sumpyter job:$SLURMJOB"
-    # Kill remote job on sunbird
-    if ! [ -z "$SLURMJOB" ]
-    then 
-        echo ssh $REMOTE "scancel $SLURMJOB"
-        ssh $REMOTE "scancel $SLURMJOB" 
+find_program_to_open_link(){
+    local OPEN=""
+    if which open &> /dev/null
+    then
+        if [ $(open --help | grep "(VT)" | wc -l ) -eq 0 ]
+        then 
+            echo open
+        else
+            # then 'open' might refer to a tool 
+            # which has nothing to do with our aims.
+            echo
+        fi
+    elif which xdg-open &> /dev/null
+    then
+        echo xdg-open
+    else
+        echo
     fi
-    if ! [ -z "$JUPYTER_PROCESS" ]
-    then 
-        echo ssh $REMOTE "kill $JUPYTER_PROCESS"
-        ssh $REMOTE "kill $JUPYTER_PROCESS" 
-    fi
- 
-    echo kill $SSHPROC 
-    echo kill $SSHTUNNELPROC
-    kill $SSHPROC
-    kill $SSHTUNNELPROC
-    
 }
 
-trap cleanup EXIT SIGINT SIGHUP
+OPEN=$(find_program_to_open_link)
+
+if [ -z "$OPEN" ]
+then 
+   echo
+   echo "No program found to open link"
+   echo "please do it manually."
+   echo
+else
+   echo
+   echo "Found program: $OPEN"
+   echo
+fi
+
+if which $OPEN &> /dev/null
+then
+echo "Opening link..."
+echo $OPEN "http://localhost:$JUPYTER_LOCAL_PORT/?token=$AUTH_TOKEN"
+$OPEN "http://localhost:$JUPYTER_LOCAL_PORT/?token=$AUTH_TOKEN"
+fi
+
+echo "If nothing happens, copy and paste this link in your browser:"
+echo
+echo http://localhost:$JUPYTER_LOCAL_PORT/?token=$AUTH_TOKEN
+echo
+echo '                     REMEMBER:'
+echo '              KEEP THIS TERMINAL OPEN.'
+echo '                 WHEN YOU ARE DONE:'
+echo ' CLICK ON THE "QUIT" BUTTON ON THE JUPYTER WEB INTERFACE.'
+echo '        AND TERMINATE THIS PROCESS WITH CTRL+C.'
+echo '      THEN YOU CAN CLOSE THE TERMINAL IF YOU WISH.'
+echo
 
 wait
