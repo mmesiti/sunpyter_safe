@@ -1,8 +1,10 @@
 #!/bin/bash 
 ACCOUNT=scw1469
+SLURM_PARTITION=accel_ai
+GRES="--gres=gpu:1"
 # This is a conda environment containing a jupyter notebook installation
-CONDA_ENV_PATH=/scratch/s.michele.mesiti/scw1469/conda
-WORKDIR=/scratch/$USER
+CONDA_ENV_PATH=/scratch/s.michele.mesiti/giannetti/conda
+WORKDIR=/scratch/$USER/giannetti
 
 export JUPYTER_CONFIG_DIR=$CONDA_ENV_PATH/etc/jupyter
 
@@ -42,12 +44,13 @@ else
 fi
 SCRIPT_CONTENT
 
-sbatch --partition compute \
+sbatch --partition $SLURM_PARTITION \
     -A $ACCOUNT \
     -o $LOG \
     -J SUNPYTER \
     --dependency=singleton \
     -n 1 \
+    $GRES \
     --oversubscribe \
     job_script_sunpyter.sh
 
